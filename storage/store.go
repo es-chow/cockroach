@@ -539,7 +539,7 @@ func (s *Store) maybeSplitRangesByConfigs(configMap PrefixConfigMap) {
 		})
 		// If the config doesn't split the range or the range isn't the
 		// leader of its consensus group, continue.
-		if n >= len(s.rangesByKey) || !s.rangesByKey[n].Desc().ContainsKey(config.Prefix) || !s.rangesByKey[n].IsLeader() {
+		if n >= len(s.rangesByKey) || !s.rangesByKey[n].Desc().ContainsKey(config.Prefix) {
 			continue
 		}
 		s.splitQueue.MaybeAdd(s.rangesByKey[n], s.clock.Now())

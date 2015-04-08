@@ -60,19 +60,19 @@ func (x *TransactionRestart) UnmarshalJSON(data []byte) error {
 // A NotLeaderError indicates that the current range is not the
 // leader. If the leader is known, its Replica is set in the error.
 type NotLeaderError struct {
-	Leader           Replica `protobuf:"bytes,1,opt,name=leader" json:"leader"`
-	XXX_unrecognized []byte  `json:"-"`
+	Leader           *Replica `protobuf:"bytes,1,opt,name=leader" json:"leader,omitempty"`
+	XXX_unrecognized []byte   `json:"-"`
 }
 
 func (m *NotLeaderError) Reset()         { *m = NotLeaderError{} }
 func (m *NotLeaderError) String() string { return proto1.CompactTextString(m) }
 func (*NotLeaderError) ProtoMessage()    {}
 
-func (m *NotLeaderError) GetLeader() Replica {
+func (m *NotLeaderError) GetLeader() *Replica {
 	if m != nil {
 		return m.Leader
 	}
-	return Replica{}
+	return nil
 }
 
 // A RangeNotFoundError indicates that a command was sent to a range
