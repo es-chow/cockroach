@@ -202,6 +202,7 @@ var _ multiraft.WriteableGroupStorage = &Range{}
 func NewRange(desc *proto.RangeDescriptor, rm RangeManager) (*Range, error) {
 	r := &Range{
 		rm:          rm,
+		closer:      make(chan struct{}),
 		cmdQ:        NewCommandQueue(),
 		tsCache:     NewTimestampCache(rm.Clock()),
 		respCache:   NewResponseCache(desc.RaftID, rm.Engine()),
@@ -242,16 +243,13 @@ func (r *Range) start() {
 	r.grantLeaderLease(&proto.Lease{
 		Expiration: math.MaxInt64,
 		StoreID:    r.rm.StoreID(),
+		Term:       1,
 	})
 }
 
 // Stop forces possibly-extant periodic gossip goroutine to stop and exit.
 func (r *Range) stop() {
-	r.Lock()
-	defer r.Unlock()
-	if r.closer != nil {
-		close(r.closer)
-	}
+	close(r.closer)
 }
 
 // Destroy cleans up all data associated with this range.
@@ -312,7 +310,6 @@ func (r *Range) HasLeaderLease() bool {
 func (r *Range) grantLeaderLease(lease *proto.Lease) {
 	r.Lock()
 	defer r.Unlock()
-
 	// Set the new leader lease.
 	var oldTerm uint64
 	if l := r.getLease(); l != nil {
@@ -327,10 +324,6 @@ func (r *Range) grantLeaderLease(lease *proto.Lease) {
 	// the timestamp and command caches and maybe start gossiping (if
 	// we're the first range).
 	if r.HasLeaderLease() && lease.Term > oldTerm {
-		if r.closer != nil {
-			close(r.closer)
-		}
-		r.closer = make(chan struct{})
 		r.tsCache.Clear(r.rm.Clock())
 		r.cmdQ.Clear()
 
@@ -340,7 +333,7 @@ func (r *Range) grantLeaderLease(lease *proto.Lease) {
 		})
 		// Only start gossiping if this range is the first range.
 		if r.IsFirstRange() {
-			go r.startGossip(r.closer)
+			go r.startGossip()
 		}
 	}
 }
@@ -727,20 +720,19 @@ func (r *Range) processRaftCommand(idKey cmdIDKey, index uint64,
 // startGossip periodically gossips the cluster ID if it's the first
 // range. This function should only be called if this range replica is
 // the raft leader.
-func (r *Range) startGossip(closer <-chan struct{}) {
+func (r *Range) startGossip() {
 	r.maybeGossipClusterID()
 	r.maybeGossipFirstRange()
 	ticker := time.NewTicker(ttlClusterIDGossip / 2)
 	for {
 		select {
 		case <-ticker.C:
-			if r.HasLeaderLease() {
-				r.maybeGossipClusterID()
-				r.maybeGossipFirstRange()
-			} else {
+			if !r.HasLeaderLease() {
 				return
 			}
-		case <-closer:
+			r.maybeGossipClusterID()
+			r.maybeGossipFirstRange()
+		case <-r.closer:
 			return
 		}
 	}
