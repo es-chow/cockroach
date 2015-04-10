@@ -114,7 +114,6 @@ func BootstrapCluster(clusterID string, eng engine.Engine, stopper *util.Stopper
 	// Create a KV DB with a local sender.
 	lSender := kv.NewLocalSender()
 	localDB := client.NewKV(nil, kv.NewTxnCoordSender(lSender, clock, false, stopper))
-	// TODO(bdarnell): arrange to have the transport closed.
 	// The bootstrapping store will not connect to other nodes so its StoreConfig
 	// doesn't really matter.
 	s := storage.NewStore(clock, eng, localDB, nil, multiraft.NewLocalRPCTransport(), storage.StoreConfig{})
@@ -125,7 +124,7 @@ func BootstrapCluster(clusterID string, eng engine.Engine, stopper *util.Stopper
 	}
 
 	// Bootstrap store to persist the store ident.
-	if err := s.Bootstrap(sIdent); err != nil {
+	if err := s.Bootstrap(sIdent, stopper); err != nil {
 		return nil, err
 	}
 	// Create first range, writing directly to engine. Note this does
@@ -239,7 +238,7 @@ func (n *Node) initStores(clock *hlc.Clock, engines []engine.Engine, stopper *ut
 
 	// Bootstrap any uninitialized stores asynchronously.
 	if bootstraps.Len() > 0 {
-		go n.bootstrapStores(bootstraps)
+		go n.bootstrapStores(bootstraps, stopper)
 	}
 
 	return nil
@@ -266,7 +265,7 @@ func (n *Node) validateStores() error {
 // and node IDs have been established for this node. Store IDs are
 // allocated via a sequence id generator stored at a system key per
 // node.
-func (n *Node) bootstrapStores(bootstraps *list.List) {
+func (n *Node) bootstrapStores(bootstraps *list.List, stopper *util.Stopper) {
 	log.Infof("bootstrapping %d store(s)", bootstraps.Len())
 
 	// Allocate a new node ID if necessary.
@@ -298,7 +297,7 @@ func (n *Node) bootstrapStores(bootstraps *list.List) {
 	}
 	for e := bootstraps.Front(); e != nil; e = e.Next() {
 		s := e.Value.(*storage.Store)
-		s.Bootstrap(sIdent)
+		s.Bootstrap(sIdent, stopper)
 		n.lSender.AddStore(s)
 		sIdent.StoreID++
 		log.Infof("bootstrapped store %s", s)
