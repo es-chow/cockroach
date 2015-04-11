@@ -124,7 +124,10 @@ func (g *group) compact() bool {
 	g.minTTLStamp = math.MaxInt64
 	g.gatekeeper = nil
 	for key, i := range g.Infos {
-		if i.TTLStamp <= now {
+		if i.expired(now) {
+			// We do not need to call g.removeInternal()
+			// since we will soon add a new info that
+			// becomes a new gatekeeper.
 			delete(g.Infos, key)
 		} else {
 			g.updateIncremental(i)
@@ -153,7 +156,7 @@ func (g *group) getInfo(key string) *info {
 	if i, ok := g.Infos[key]; ok {
 		// Check TTL and discard if too old.
 		now := time.Now().UnixNano()
-		if i.TTLStamp <= now {
+		if i.expired(now) {
 			g.removeInternal(i)
 			return nil
 		}
@@ -171,7 +174,7 @@ func (g *group) infosAsSlice() infoSlice {
 	for _, i := range g.Infos {
 		// Check TTL and discard if too old.
 		if i.expired(now) {
-			delete(g.Infos, i.Key)
+			g.removeInternal(i)
 		} else {
 			infos = append(infos, i)
 		}
