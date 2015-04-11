@@ -22,6 +22,14 @@ import (
 	"sync/atomic"
 )
 
+const (
+	// RUNNING is the state of a stopper before invoking Stop().
+	RUNNING = int32(0)
+	// DRAINING is the state of a stopper while refusing new tasks and waiting
+	// for existing work to finish.
+	DRAINING = int32(1)
+)
+
 // Closer is an interface for objects to attach to the stopper to
 // be closed once the stopper completes.
 type Closer interface {
@@ -43,12 +51,14 @@ type Closer interface {
 // to shut down. Once shutdown, each worker invokes SetStopped(). When
 // all workers have shutdown, the stopper is complete.
 type Stopper struct {
-	stopper  chan struct{}
-	draining int32
-	drain    sync.WaitGroup
-	stop     sync.WaitGroup
-	mu       sync.Mutex // Protects the slice of Closers
-	closers  []Closer
+	stopper chan struct{}
+	state   int32
+	drain   sync.WaitGroup
+	stop    sync.WaitGroup
+	// mu protects the slice of Closers and adding/waiting on the
+	// stop WaitGroup.
+	mu      sync.Mutex
+	closers []Closer
 }
 
 // NewStopper returns an instance of Stopper. Count specifies how
@@ -56,18 +66,50 @@ type Stopper struct {
 func NewStopper() *Stopper {
 	return &Stopper{
 		stopper: make(chan struct{}),
+		state:   RUNNING,
 	}
+}
+
+func (s *Stopper) setState(newS int32) {
+	oldS := s.getState()
+	if !atomic.CompareAndSwapInt32(&s.state, oldS, newS) {
+		panic("concurrent access changed state")
+	}
+}
+
+func (s *Stopper) getState() int32 {
+	return atomic.LoadInt32(&s.state)
 }
 
 // AddWorker worker to the stopper.
 func (s *Stopper) AddWorker() {
+	// If we're already draining, we might already be waiting on the stop
+	// WaitGroup, and it's a data race to add to it now. We hold the lock
+	// while waiting, so obtaining the lock here prevents that race.
+	// This means that possibly we only add to the WaitGroup after the
+	// stopper has shut down, but Closers added when the stopper is not are
+	// closed immediately, so the worker will stop anyways.
+	//
+	// This will likely never happen outside of tests, where we sometimes
+	// create and stop components in rapid succession.
+	s.mu.Lock()
 	s.stop.Add(1)
+	s.mu.Unlock()
 }
 
 // AddCloser adds an object to close after the stopper has been stopped.
 func (s *Stopper) AddCloser(c Closer) {
+	// Hold the lock to make sure we don't cut through a half-way Stop().
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// If the state is not RUNNING, and we have the lock, then we should already
+	// done closing the stoppers in s.closers. The right thing to do is to just
+	// close it directly, and to never add it to the slice.
+	if s.getState() != RUNNING {
+		c.Close()
+		return
+	}
+	// Otherwise, the closers are not yet being processed, so we can add it.
 	s.closers = append(s.closers, c)
 }
 
@@ -82,7 +124,7 @@ func (s *Stopper) AddCloser(c Closer) {
 // Returns true if the task can be launched or false to indicate the
 // system is currently draining and the task should be refused.
 func (s *Stopper) StartTask() bool {
-	if atomic.LoadInt32(&s.draining) == 0 {
+	if s.getState() == RUNNING {
 		s.drain.Add(1)
 		return true
 	}
@@ -90,7 +132,8 @@ func (s *Stopper) StartTask() bool {
 }
 
 // FinishTask removes one from the count of tasks left to drain in the
-// system. This function must be invoked for every call to StartTask().
+// system. This function must be invoked for every successful call to
+// StartTask().
 func (s *Stopper) FinishTask() {
 	s.drain.Done()
 }
@@ -98,12 +141,14 @@ func (s *Stopper) FinishTask() {
 // Stop signals all live workers to stop and then waits for each to
 // confirm it has stopped (workers do this by calling SetStopped()).
 func (s *Stopper) Stop() {
-	atomic.StoreInt32(&s.draining, 1)
+	// Hold the lock all the time, so that AddWorker can't add to the
+	// stop WaitGroup while we Wait().
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.setState(DRAINING)
 	s.drain.Wait()
 	close(s.stopper)
 	s.stop.Wait()
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	for _, c := range s.closers {
 		c.Close()
 	}
@@ -131,7 +176,7 @@ func (s *Stopper) SetStopped() {
 // complete, then moves back to non-draining state. This is used from
 // unittests.
 func (s *Stopper) Quiesce() {
-	atomic.StoreInt32(&s.draining, 1)
-	defer atomic.StoreInt32(&s.draining, 0)
+	s.setState(DRAINING)
+	defer s.setState(RUNNING)
 	s.drain.Wait()
 }
