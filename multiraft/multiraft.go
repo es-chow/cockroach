@@ -150,7 +150,7 @@ func NewMultiRaft(nodeID proto.RaftNodeID, config *Config, stopper *stop.Stopper
 		nodeID:    nodeID,
 
 		// Output channel.
-		Events: make(chan interface{}, config.EventBufferSize),
+		Events: make(chan interface{}, 1), //config.EventBufferSize),
 
 		// Input channels.
 		reqChan:         make(chan *RaftMessageRequest, reqBufferSize),
@@ -184,10 +184,18 @@ func (ms *multiraftServer) RaftMessage(req *RaftMessageRequest) (*RaftMessageRes
 	}
 }
 
-func (m *MultiRaft) sendEvent(event interface{}) {
+func (s *state) sendEvent(event interface{}) {
+	// If there is any pending event, append the event to preserve the order.
+	if len(s.pendingEvents) > 0 {
+		s.pendingEvents = append(s.pendingEvents, event)
+		return
+	}
 	select {
-	case m.Events <- event:
-	case <-m.stopper.ShouldStop():
+	case s.Events <- event:
+	case <-s.stopper.ShouldStop():
+	default:
+		s.pendingEvents = append(s.pendingEvents, event)
+		log.Warning("eventsChan full")
 	}
 }
 
@@ -426,17 +434,19 @@ func (n *node) unregisterGroup(groupID proto.RangeID) {
 // synchronization.
 type state struct {
 	*MultiRaft
-	groups    map[proto.RangeID]*group
-	nodes     map[proto.RaftNodeID]*node
-	writeTask *writeTask
+	groups        map[proto.RangeID]*group
+	nodes         map[proto.RaftNodeID]*node
+	writeTask     *writeTask
+	pendingEvents []interface{}
 }
 
 func newState(m *MultiRaft) *state {
 	return &state{
-		MultiRaft: m,
-		groups:    make(map[proto.RangeID]*group),
-		nodes:     make(map[proto.RaftNodeID]*node),
-		writeTask: newWriteTask(m.Storage),
+		MultiRaft:     m,
+		groups:        make(map[proto.RangeID]*group),
+		nodes:         make(map[proto.RaftNodeID]*node),
+		writeTask:     newWriteTask(m.Storage),
+		pendingEvents: make([]interface{}, 0),
 	}
 }
 
@@ -466,6 +476,8 @@ func (s *state) start() {
 			// performing all writes synchronously.
 			// TODO(bdarnell): either reinstate writeReady or rip it out completely.
 			//var writeReady chan struct{}
+			var eventsChan chan interface{}
+			var event interface{}
 
 			// The order of operations in this loop structure is as follows:
 			// start by setting raftReady to the multiNode's Ready()
@@ -478,6 +490,11 @@ func (s *state) start() {
 				//writeReady = s.writeTask.ready
 			} else if writingGroups == nil {
 				raftReady = s.multiNode.Ready()
+			}
+
+			if len(s.pendingEvents) > 0 {
+				eventsChan = s.Events
+				event = s.pendingEvents[0]
 			}
 
 			if log.V(8) {
@@ -567,6 +584,30 @@ func (s *state) start() {
 				if ticks >= s.HeartbeatIntervalTicks {
 					ticks = 0
 					s.coalescedHeartbeat()
+				}
+
+			case eventsChan <- event:
+				// Send as many as possible events to eventsChan
+				// until it's full or no pending events
+				sendIndex := 1
+				full := false
+				for {
+					if sendIndex < len(s.pendingEvents) {
+						event = s.pendingEvents[sendIndex]
+					} else {
+						s.pendingEvents = make([]interface{}, 0)
+						break
+					}
+					select {
+					case eventsChan <- event:
+						sendIndex++
+					default:
+						full = true
+					}
+					if full {
+						s.pendingEvents = s.pendingEvents[sendIndex:]
+						break
+					}
 				}
 
 			case cb := <-s.callbackChan:
