@@ -259,6 +259,9 @@ type Store struct {
 	feed              StoreEventFeed  // Event Feed
 	removeReplicaChan chan removeReplicaOp
 	wakeRaftLoop      chan struct{}
+	raftWriteIdle     chan struct{}
+	raftWriteOut      chan struct{}
+	raftWriteIn       chan map[*Replica]raft.Ready
 	started           int32
 	stopper           *stop.Stopper
 	startedAt         int64
@@ -390,6 +393,9 @@ func NewStore(ctx StoreContext, eng engine.Engine, nodeDesc *roachpb.NodeDescrip
 		removeReplicaChan: make(chan removeReplicaOp),
 		wakeRaftLoop:      make(chan struct{}, 1),
 		raftRequestChan:   make(chan *RaftMessageRequest, raftReqBufferSize),
+		raftWriteIdle:     make(chan struct{}),
+		raftWriteIn:       make(chan map[*Replica]raft.Ready, 1),
+		raftWriteOut:      make(chan struct{}, 1),
 	}
 
 	s.mu.Lock()
@@ -553,6 +559,7 @@ func (s *Store) Start(stopper *stop.Stopper) error {
 		return err
 	}
 	s.processRaft()
+	s.processRaftWrite()
 
 	// Gossip is only ever nil while bootstrapping a cluster and
 	// in unittests.
@@ -1564,29 +1571,70 @@ func (s *Store) processRaft() {
 		defer s.ctx.Transport.Stop(s.StoreID())
 		ticker := time.NewTicker(s.ctx.RaftTickInterval)
 		defer ticker.Stop()
-		for {
-			var replicas []*Replica
-			s.mu.Lock()
-			for rangeID := range s.mu.pendingRaftGroups {
-				r, ok := s.mu.replicas[rangeID]
-				if !ok {
-					continue
-				}
-				replicas = append(replicas, r)
 
-			}
-			if len(s.mu.pendingRaftGroups) > 0 {
-				s.mu.pendingRaftGroups = map[roachpb.RangeID]struct{}{}
-			}
+		pendingReady := map[*Replica]raft.Ready{}
+		pendingWriteReady := map[*Replica]raft.Ready{}
+		for {
+			var raftWriteIdle chan struct{}
+			s.mu.Lock()
+			pendingRaftRaftGroupsLen := len(s.mu.pendingRaftGroups)
 			s.mu.Unlock()
-			for _, r := range replicas {
-				if err := r.handleRaftReady(); err != nil {
-					panic(err) // TODO(bdarnell)
-				}
+			if len(pendingWriteReady) == 0 && pendingRaftRaftGroupsLen != 0 {
+				//log.Infof("zzz, set writeIdle")
+				raftWriteIdle = s.raftWriteIdle
 			}
 
 			select {
 			case <-s.wakeRaftLoop:
+
+			case raftWriteIdle <- struct{}{}:
+				//				log.Infof("zzz, writeIdle return idle")
+				var replicas []*Replica
+				s.mu.Lock()
+				for rangeID := range s.mu.pendingRaftGroups {
+					r, ok := s.mu.replicas[rangeID]
+					if !ok {
+						continue
+					}
+					replicas = append(replicas, r)
+
+				}
+				if len(s.mu.pendingRaftGroups) > 0 {
+					s.mu.pendingRaftGroups = map[roachpb.RangeID]struct{}{}
+				}
+				s.mu.Unlock()
+				for _, r := range replicas {
+					rd, err := r.handleRaftReady()
+					//					log.Infof("zzz, range :%d find ready for %+v", r.RangeID, rd)
+					if err != nil {
+						panic(err) // TODO(bdarnell)
+					}
+					if rd != nil {
+						pendingReady[r] = *rd
+						if len(rd.Entries) != 0 || !raft.IsEmptyHardState(rd.HardState) || !raft.IsEmptySnap(rd.Snapshot) {
+							pendingWriteReady[r] = *rd
+						}
+					}
+				}
+				// If nothing to write, directly call r.handleRaftWriteResponse
+				if len(pendingWriteReady) == 0 && len(pendingReady) != 0 {
+					//					log.Infof("zzz, no writeReady pending, call handleRaftWriteResponse len(pendingReady) %v", len(pendingReady))
+					for r, rd := range pendingReady {
+						r.handleRaftWriteResponse(rd)
+					}
+					pendingWriteReady = map[*Replica]raft.Ready{}
+					pendingReady = map[*Replica]raft.Ready{}
+					continue
+				}
+				s.raftWriteIn <- pendingWriteReady
+
+			case <-s.raftWriteOut:
+				//				log.Infof("zzz, writeOut return")
+				for r, rd := range pendingReady {
+					r.handleRaftWriteResponse(rd)
+				}
+				pendingWriteReady = map[*Replica]raft.Ready{}
+				pendingReady = map[*Replica]raft.Ready{}
 
 			case op := <-s.removeReplicaChan:
 				op.ch <- s.removeReplicaImpl(op.rep, op.origDesc, op.destroy)
@@ -1607,6 +1655,33 @@ func (s *Store) processRaft() {
 				}
 				s.mu.Unlock()
 
+			case <-s.stopper.ShouldStop():
+				return
+			}
+		}
+	})
+}
+
+// processRaftWrite processes write commands that have been committed
+// by the raft consensus algorithm, dispatching them to the
+// appropriate range. This method starts a goroutine to process Raft
+// commands indefinitely or until the stopper signals.
+func (s *Store) processRaftWrite() {
+	s.stopper.RunWorker(func() {
+		for {
+			select {
+			case <-s.raftWriteIdle:
+				//				log.Infof("zzz, writeTask receive raftWriteIdle")
+
+			case request := <-s.raftWriteIn:
+				//				log.Infof("zzz, writeTask receive raftWriteIn")
+				if log.V(6) {
+					log.Infof("writeTask got request %#v", request)
+				}
+				for r, rd := range request {
+					r.handleRaftWriteRequest(rd)
+				}
+				s.raftWriteOut <- struct{}{}
 			case <-s.stopper.ShouldStop():
 				return
 			}

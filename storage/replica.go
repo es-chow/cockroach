@@ -1056,18 +1056,24 @@ func (r *Replica) proposePendingCmdLocked(idKey cmdIDKey, p *pendingCmd) error {
 	return r.mu.raftGroup.Propose(encodeRaftCommand(string(idKey), data))
 }
 
-func (r *Replica) handleRaftReady() error {
+func (r *Replica) handleRaftReady() (*raft.Ready, error) {
 	// TODO(bram): There is a lot of locking and unlocking of the replica,
 	// consider refactoring this.
 	r.mu.Lock()
 	if !r.mu.raftGroup.HasReady() {
 		r.mu.Unlock()
-		return nil
+		return nil, nil
 	}
 	rd := r.mu.raftGroup.Ready()
-	lastIndex := r.mu.lastIndex
 	r.mu.Unlock()
 	logRaftReady(r.store.StoreID(), r.RangeID, rd)
+	return &rd, nil
+}
+
+func (r *Replica) handleRaftWriteRequest(rd raft.Ready) error {
+	r.mu.Lock()
+	lastIndex := r.mu.lastIndex
+	r.mu.Unlock()
 
 	batch := r.store.Engine().NewBatch()
 	defer batch.Close()
@@ -1096,6 +1102,10 @@ func (r *Replica) handleRaftReady() error {
 	r.mu.lastIndex = lastIndex
 	r.mu.Unlock()
 
+	return nil
+}
+
+func (r *Replica) handleRaftWriteResponse(rd raft.Ready) error {
 	for _, msg := range rd.Messages {
 		r.sendRaftMessage(msg)
 	}
